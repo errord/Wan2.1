@@ -98,12 +98,7 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        self.clip = CLIPModel(
-            dtype=config.clip_dtype,
-            device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir,
-                                         config.clip_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+        self.clip = self._load_clip(config, checkpoint_dir, 'quantized')
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         if cpu_offload:
@@ -146,6 +141,26 @@ class WanI2V:
                 self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
+
+    def _load_clip(self, config, checkpoint_dir, mode_type):
+        if mode_type == 'quantized':
+            from .utils.load_model import load_torch_file
+            from .modules.clip_v import CLIPModel
+            sd = load_torch_file(os.path.join(checkpoint_dir, config.clip_checkpoint), safe_load=True)
+            if "log_scale" not in sd:
+                raise ValueError("Invalid CLIP model, this node expectes the 'open-clip-xlm-roberta-large-vit-huge-14' model")
+            
+            clip_model = CLIPModel(dtype=config.clip_dtype, device=self.device, state_dict=sd)
+            clip_model.model.to(self.device)
+            self.clip = clip_model
+            del sd
+        else:
+            self.clip = CLIPModel(
+                dtype=config.clip_dtype,
+                device=self.device,
+                checkpoint_path=os.path.join(checkpoint_dir,
+                                            config.clip_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
 
     def generate(self,
                  input_prompt,

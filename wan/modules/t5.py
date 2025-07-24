@@ -442,7 +442,9 @@ def _t5(name,
         model = model_cls(**kwargs)
 
     # set device
-    model = model.to(dtype=dtype, device=device)
+    # only set device if not cpu
+    if device != 'cpu':
+        model = model.to(dtype=dtype, device=device)
 
     # init tokenizer
     if return_tokenizer:
