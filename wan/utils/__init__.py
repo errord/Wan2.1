@@ -1,13 +1,24 @@
-from .fm_solvers import (
-    FlowDPMSolverMultistepScheduler,
-    get_sampling_sigmas,
-    retrieve_timesteps,
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+
+from .model_loader import (
+    SafetensorsModelLoader,
+    ModelInitializer, 
+    patch_wan_models,
+    create_bf16_safetensors_config,
+    verify_model_compatibility
 )
-from .fm_solvers_unipc import FlowUniPCMultistepScheduler
-from .vace_processor import VaceVideoProcessor
+
+# Auto-patch models on import
+try:
+    patch_wan_models()
+except Exception as e:
+    import logging
+    logging.warning(f"Could not auto-patch model classes: {e}")
 
 __all__ = [
-    'HuggingfaceTokenizer', 'get_sampling_sigmas', 'retrieve_timesteps',
-    'FlowDPMSolverMultistepScheduler', 'FlowUniPCMultistepScheduler',
-    'VaceVideoProcessor'
+    'SafetensorsModelLoader',
+    'ModelInitializer',
+    'patch_wan_models', 
+    'create_bf16_safetensors_config',
+    'verify_model_compatibility'
 ]

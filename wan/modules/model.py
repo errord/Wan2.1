@@ -490,6 +490,27 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+    @classmethod
+    def from_pretrained_bf16(
+        cls,
+        checkpoint_dir,
+        model_filename=None,
+        device="cpu",
+        **kwargs
+    ):
+        """Load model with automatic bf16 safetensors support"""
+        try:
+            from ..utils.model_loader import ModelInitializer
+            return ModelInitializer.auto_initialize_model(
+                cls, checkpoint_dir, 
+                target_dtype=torch.bfloat16, 
+                device=device,
+                **kwargs
+            )
+        except ImportError:
+            # Fallback to original method if loader not available
+            return cls.from_pretrained(checkpoint_dir)
+
     def forward(
         self,
         x,

@@ -99,7 +99,22 @@ class WanFLF2V:
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        
+        # Use enhanced loader if enabled
+        use_enhanced_loader = getattr(config, 'use_enhanced_loader', False)
+        if use_enhanced_loader:
+            try:
+                logging.info("Using enhanced model loader for WanModel")
+                self.model = WanModel.from_pretrained_bf16(
+                    checkpoint_dir, 
+                    device="cpu"
+                )
+            except AttributeError:
+                logging.warning("Enhanced loader not available, falling back to standard loader")
+                self.model = WanModel.from_pretrained(checkpoint_dir)
+        else:
+            self.model = WanModel.from_pretrained(checkpoint_dir)
+            
         self.model.eval().requires_grad_(False)
 
         if t5_fsdp or dit_fsdp or use_usp:

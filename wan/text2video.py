@@ -38,6 +38,7 @@ class WanT2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        use_enhanced_loader=None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -59,6 +60,9 @@ class WanT2V:
                 Enable distribution strategy of USP.
             t5_cpu (`bool`, *optional*, defaults to False):
                 Whether to place T5 model on CPU. Only works without t5_fsdp.
+            use_enhanced_loader (`bool`, *optional*, defaults to None):
+                Whether to use enhanced model loader for bf16 safetensors support.
+                If None, will use config.use_enhanced_loader if available.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -67,6 +71,10 @@ class WanT2V:
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
+
+        # Determine whether to use enhanced loader
+        if use_enhanced_loader is None:
+            use_enhanced_loader = getattr(config, 'use_enhanced_loader', False)
 
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
@@ -84,7 +92,21 @@ class WanT2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        
+        # Use enhanced loader if enabled
+        if use_enhanced_loader:
+            try:
+                logging.info("Using enhanced model loader for WanModel")
+                self.model = WanModel.from_pretrained_bf16(
+                    checkpoint_dir, 
+                    device="cpu"
+                )
+            except AttributeError:
+                logging.warning("Enhanced loader not available, falling back to standard loader")
+                self.model = WanModel.from_pretrained(checkpoint_dir)
+        else:
+            self.model = WanModel.from_pretrained(checkpoint_dir)
+            
         self.model.eval().requires_grad_(False)
 
         if use_usp:

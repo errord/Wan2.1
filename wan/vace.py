@@ -92,7 +92,22 @@ class WanVace(WanT2V):
             device=self.device)
 
         logging.info(f"Creating VaceWanModel from {checkpoint_dir}")
-        self.model = VaceWanModel.from_pretrained(checkpoint_dir)
+        
+        # Use enhanced loader if enabled
+        use_enhanced_loader = getattr(config, 'use_enhanced_loader', False)
+        if use_enhanced_loader:
+            try:
+                logging.info("Using enhanced model loader for VaceWanModel")
+                self.model = VaceWanModel.from_pretrained_bf16(
+                    checkpoint_dir, 
+                    device="cpu"
+                )
+            except AttributeError:
+                logging.warning("Enhanced loader not available, falling back to standard loader")
+                self.model = VaceWanModel.from_pretrained(checkpoint_dir)
+        else:
+            self.model = VaceWanModel.from_pretrained(checkpoint_dir)
+            
         self.model.eval().requires_grad_(False)
 
         if use_usp:
