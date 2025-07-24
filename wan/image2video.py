@@ -98,7 +98,7 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        self.clip = self._load_clip(config, checkpoint_dir, 'quantized')
+        self.clip = self._load_clip(config, checkpoint_dir, 'full')
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         if cpu_offload:
