@@ -148,19 +148,24 @@ class WanI2V:
             from .modules.clip_v import CLIPModel
             sd = load_torch_file(os.path.join(checkpoint_dir, config.clip_checkpoint), safe_load=True)
             if "log_scale" not in sd:
-                raise ValueError("Invalid CLIP model, this node expectes the 'open-clip-xlm-roberta-large-vit-huge-14' model")
+                logging.warning("Invalid CLIP model, this node expectes the 'open-clip-xlm-roberta-large-vit-huge-14' model")
+                # quantized model has no log_scale, so we need to add it
+                # wan2.1 not use log_scale
+                sd['log_scale'] = torch.tensor(4.6055, dtype=torch.float16)
             
             clip_model = CLIPModel(dtype=config.clip_dtype, device=self.device, state_dict=sd)
             clip_model.model.to(self.device)
-            self.clip = clip_model
             del sd
+            return clip_model
         else:
-            self.clip = CLIPModel(
+            from .modules.clip import CLIPModel
+            clip = CLIPModel(
                 dtype=config.clip_dtype,
                 device=self.device,
                 checkpoint_path=os.path.join(checkpoint_dir,
                                             config.clip_checkpoint),
                 tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+            return clip
 
     def generate(self,
                  input_prompt,
