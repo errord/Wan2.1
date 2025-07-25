@@ -80,6 +80,8 @@ class WanI2V:
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
 
+        self.quantized = False
+
         assert not cpu_offload or (cpu_offload and dit_fsdp), "When cpu_offload is True, dit_fsdp must also be True"
 
         shard_fn = partial(shard_model, device_id=device_id)
@@ -98,15 +100,16 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        self.clip = self._load_clip(config, checkpoint_dir, 'full')
+        self.clip = self._load_clip(config, checkpoint_dir)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
+        torch_dtype = torch.bfloat16 if self.quantized else torch.float32
         if cpu_offload:
             # For FSDP and cpu_offload, force CPU initialization to avoid OOM
             with torch.device('cpu'):
-                self.model = WanModel.from_pretrained(checkpoint_dir)
+                self.model = WanModel.from_pretrained(checkpoint_dir, torch_dtype=torch_dtype)
         else:
-            self.model = WanModel.from_pretrained(checkpoint_dir)
+            self.model = WanModel.from_pretrained(checkpoint_dir, torch_dtype=torch_dtype)
         self.model.eval().requires_grad_(False)
 
 
@@ -142,8 +145,9 @@ class WanI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def _load_clip(self, config, checkpoint_dir, mode_type):
-        if mode_type == 'quantized':
+    def _load_clip(self, config, checkpoint_dir):
+        quantized = False
+        if quantized:
             from .utils.load_model import load_torch_file
             from .modules.clip_v import CLIPModel
             sd = load_torch_file(os.path.join(checkpoint_dir, config.clip_checkpoint), safe_load=True)
@@ -274,6 +278,10 @@ class WanI2V:
         if offload_model:
             self.clip.model.cpu()
 
+        print('start vae encode....')
+        torch.cuda.reset_peak_memory_stats()
+        start_mem = torch.cuda.memory_allocated()
+
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
@@ -284,6 +292,21 @@ class WanI2V:
                          dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
+
+        end_mem = torch.cuda.memory_allocated()
+        peak_mem = torch.cuda.max_memory_allocated()
+
+        print(f"VAE Start: {start_mem/1024/1024:.2f} MB, End: {end_mem/1024/1024:.2f} MB, Peak: {peak_mem/1024/1024:.2f} MB")
+        print(f"VAE Estimated activations: {(peak_mem - start_mem)/1024/1024:.2f} MB")
+        print('end vae encode....')
+
+        self.text_encoder.model.cpu()
+        self.clip.model.cpu()
+        self.vae.model.cpu()
+        torch.cuda.empty_cache()
+        
+        if not self.cpu_offload:
+            self.model.to(self.device)
 
         @contextmanager
         def noop_no_sync():
@@ -345,6 +368,9 @@ class WanI2V:
 
                 timestep = torch.stack(timestep).to(self.device)
 
+                torch.cuda.reset_peak_memory_stats()
+                start_mem = torch.cuda.memory_allocated()
+
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0].to(
                         torch.device('cpu') if offload_model else self.device)
@@ -353,6 +379,13 @@ class WanI2V:
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0].to(
                         torch.device('cpu') if offload_model else self.device)
+
+                end_mem = torch.cuda.memory_allocated()
+                peak_mem = torch.cuda.max_memory_allocated()
+
+                print(f"Wan Start: {start_mem/1024/1024:.2f} MB, End: {end_mem/1024/1024:.2f} MB, Peak: {peak_mem/1024/1024:.2f} MB")
+                print(f"Wan Estimated activations: {(peak_mem - start_mem)/1024/1024:.2f} MB")
+
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + guide_scale * (
