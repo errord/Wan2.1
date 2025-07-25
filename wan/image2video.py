@@ -85,7 +85,7 @@ class WanI2V:
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
 
-        self.quantized = False
+        self.quantized = True
 
         assert not cpu_offload or (cpu_offload and dit_fsdp), "When cpu_offload is True, dit_fsdp must also be True"
 
