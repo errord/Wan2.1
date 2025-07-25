@@ -15,6 +15,7 @@ import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
+import torch.distributed.fsdp
 
 from .distributed.fsdp import shard_model, shard_model_with_cpu_offload
 from .modules.clip import CLIPModel
@@ -28,6 +29,9 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+
+import torch.distributed as dist
+dist.set_debug_level(dist.DebugLevel.INFO)
 
 class WanI2V:
 
