@@ -284,6 +284,13 @@ class WanI2V:
             self.clip.model.cpu()
 
         print('start vae encode....')
+    
+        if self.quantized:
+            self.text_encoder.model.cpu()
+            self.clip.model.cpu()
+            self.model.cpu()
+            torch.cuda.empty_cache()
+
         torch.cuda.reset_peak_memory_stats()
         start_mem = torch.cuda.memory_allocated()
 
