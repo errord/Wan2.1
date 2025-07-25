@@ -30,6 +30,7 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
+from torch.distributed.fsdp._debug_utils import SimpleProfiler
 import torch.distributed as dist
 dist.set_debug_level(dist.DebugLevel.INFO)
 
@@ -408,6 +409,8 @@ class WanI2V:
 
                 x0 = [latent.to(self.device)]
                 del latent_model_input, timestep
+
+                SimpleProfiler.dump_and_reset("Wan step: ")
 
             if offload_model:
                 self.model.cpu()
