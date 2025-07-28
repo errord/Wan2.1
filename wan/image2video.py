@@ -125,7 +125,8 @@ class WanI2V:
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
 
-        self.quantized = True
+        # cpu offload run on float32, quantized run on bfloat16
+        self.quantized = False if self.cpu_offload else True
 
         assert not cpu_offload or (cpu_offload and dit_fsdp), "When cpu_offload is True, dit_fsdp must also be True"
 
@@ -470,7 +471,7 @@ class WanI2V:
                         generator=seed_g)[0]
                     latent = temp_x0.squeeze(0)
 
-                    x0 = [latent.to(self.device)]
+                x0 = [latent.to(self.device)]
 
                 del latent_model_input, timestep
 
