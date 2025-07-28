@@ -375,6 +375,7 @@ class WanI2V:
             else:
                 self.model.to(self.device)
             for _, t in enumerate(tqdm(timesteps)):
+                logging.info(f"model and tensor to device: {torch.device('cpu') if offload_model else self.device}")
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
