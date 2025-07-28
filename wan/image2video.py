@@ -426,56 +426,57 @@ class WanI2V:
                     self.model.to(self.device)
 
             for _, t in enumerate(tqdm(timesteps)):
-                logging.info(f"model and tensor to device: {torch.device('cpu') if offload_model else self.device}")
+                with execution_timer("Wan I2V wan model one step all"):
+                    logging.info(f"model and tensor to device: {torch.device('cpu') if offload_model else self.device}")
 
-                with execution_timer("Wan I2V wan model forward step init"):
-                    latent_model_input = [latent.to(self.device)]
-                    timestep = [t]
+                    with execution_timer("Wan I2V wan model forward step init"):
+                        latent_model_input = [latent.to(self.device)]
+                        timestep = [t]
 
-                    timestep = torch.stack(timestep).to(self.device)
+                        timestep = torch.stack(timestep).to(self.device)
 
-                    torch.cuda.reset_peak_memory_stats()
-                    start_mem = torch.cuda.memory_allocated()
+                        torch.cuda.reset_peak_memory_stats()
+                        start_mem = torch.cuda.memory_allocated()
 
-                with execution_timer("Wan I2V wan model forward"):
-                    noise_pred_cond = self.model(
-                        latent_model_input, t=timestep, **arg_c)[0].to(
+                    with execution_timer("Wan I2V wan model forward"):
+                        noise_pred_cond = self.model(
+                            latent_model_input, t=timestep, **arg_c)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        noise_pred_uncond = self.model(
+                            latent_model_input, t=timestep, **arg_null)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+
+                    end_mem = torch.cuda.memory_allocated()
+                    peak_mem = torch.cuda.max_memory_allocated()
+
+                    print(f"Wan Start: {start_mem/1024/1024:.2f} MB, End: {end_mem/1024/1024:.2f} MB, Peak: {peak_mem/1024/1024:.2f} MB")
+                    print(f"Wan Estimated activations: {(peak_mem - start_mem)/1024/1024:.2f} MB")
+
+                    with execution_timer("Wan I2V wan model forward step close"):
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        noise_pred = noise_pred_uncond + guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
+
+                        latent = latent.to(
                             torch.device('cpu') if offload_model else self.device)
-                    if offload_model:
-                        torch.cuda.empty_cache()
-                    noise_pred_uncond = self.model(
-                        latent_model_input, t=timestep, **arg_null)[0].to(
-                            torch.device('cpu') if offload_model else self.device)
 
-                end_mem = torch.cuda.memory_allocated()
-                peak_mem = torch.cuda.max_memory_allocated()
+                    with execution_timer("Wan I2V wan model sample"):
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred.unsqueeze(0),
+                            t,
+                            latent.unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g)[0]
+                        latent = temp_x0.squeeze(0)
 
-                print(f"Wan Start: {start_mem/1024/1024:.2f} MB, End: {end_mem/1024/1024:.2f} MB, Peak: {peak_mem/1024/1024:.2f} MB")
-                print(f"Wan Estimated activations: {(peak_mem - start_mem)/1024/1024:.2f} MB")
+                    x0 = [latent.to(self.device)]
 
-                with execution_timer("Wan I2V wan model forward step close"):
-                    if offload_model:
-                        torch.cuda.empty_cache()
-                    noise_pred = noise_pred_uncond + guide_scale * (
-                        noise_pred_cond - noise_pred_uncond)
+                    del latent_model_input, timestep
 
-                    latent = latent.to(
-                        torch.device('cpu') if offload_model else self.device)
-
-                with execution_timer("Wan I2V wan model sample"):
-                    temp_x0 = sample_scheduler.step(
-                        noise_pred.unsqueeze(0),
-                        t,
-                        latent.unsqueeze(0),
-                        return_dict=False,
-                        generator=seed_g)[0]
-                    latent = temp_x0.squeeze(0)
-
-                x0 = [latent.to(self.device)]
-
-                del latent_model_input, timestep
-
-                SimpleProfiler.dump_and_reset("Wan step: ")
+                    SimpleProfiler.dump_and_reset("Wan step: ")
 
             if offload_model:
                 self.model.cpu()
