@@ -7,7 +7,20 @@ export MASTER_PORT='7860'
 export RANK='1'
 export WORLD_SIZE='2'
 export LOCAL_RANK='0'
+
+# NCCL Network configuration  
 export NCCL_SOCKET_IFNAME='enp33s0'
+export NCCL_TIMEOUT=1800
+export NCCL_DEBUG=INFO
+
+# Gloo configuration for CPU communication
+export GLOO_SOCKET_IFNAME='enp33s0'
+export GLOO_TIMEOUT=1800
+export GLOO_DEVICE_TRANSPORT=TCP
+
+# Disable problematic features
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
 
 # Run the generate.py script with specified parameters
 # like: ./start_rank1.sh --dit_fsdp --sample_steps 40 --task i2v-14B --size 480*640 --ckpt_dir ./Wan2.1-I2V-14B-480P --image examples/i2v_input.JPG --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
