@@ -21,16 +21,16 @@ def timer(description: str):
 
 
 class LargeTestModel(nn.Module):
-    """Large test model for 20GB parameter size"""
+    """Large test model for ~20GB parameter size"""
     
-    def __init__(self, hidden_size: int = 8192, num_layers: int = 12, vocab_size: int = 50000):
+    def __init__(self, hidden_size: int = 6144, num_layers: int = 8, vocab_size: int = 32000):
         super().__init__()
         self.hidden_size = hidden_size
         
-        # Embedding layer (large vocab for bigger model)
+        # Embedding layer
         self.embedding = nn.Embedding(vocab_size, hidden_size)
         
-        # Multiple large transformer-like layers
+        # Transformer-like layers with controlled size
         self.layers = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(hidden_size),
@@ -41,17 +41,58 @@ class LargeTestModel(nn.Module):
             ) for _ in range(num_layers)
         ])
         
-        # Additional large layers to reach ~20GB
-        self.extra_layers = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size) for _ in range(8)
-        ])
+        # Additional layers to reach target size more precisely
+        # Calculate remaining parameters needed for ~20GB
+        current_params = self._estimate_current_params()
+        target_params = int((20 * 1024**3) / 4)  # 20GB in float32 parameters
         
-        # Large output layer
+        if current_params < target_params:
+            remaining_params = target_params - current_params
+            # Add one large linear layer to reach target
+            extra_dim = int((remaining_params / hidden_size) ** 0.5)
+            extra_dim = min(extra_dim, 16384)  # Cap at reasonable size
+            if extra_dim > hidden_size:
+                self.extra_layer = nn.Linear(hidden_size, extra_dim)
+            else:
+                self.extra_layer = None
+        else:
+            self.extra_layer = None
+        
+        # Output layer
         self.ln_f = nn.LayerNorm(hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size)
         
-        print(f"Model parameter count: {self.get_param_count():,}")
-        print(f"Estimated model size: {self.get_model_size_gb():.2f} GB")
+        # Report actual model statistics
+        actual_params = self.get_param_count()
+        actual_size_gb = self.get_model_size_gb()
+        print(f"Model parameter count: {actual_params:,}")
+        print(f"Actual model size: {actual_size_gb:.2f} GB")
+        
+        # Validate size is reasonable
+        if actual_size_gb > 22:
+            print(f"Warning: Model size {actual_size_gb:.2f}GB may be too large!")
+    
+    def _estimate_current_params(self):
+        """Estimate parameters without the extra layer"""
+        # Embedding
+        embed_params = self.embedding.weight.numel()
+        
+        # Transformer layers
+        layer_params = 0
+        for layer in self.layers:
+            for module in layer.modules():
+                if isinstance(module, nn.Linear):
+                    layer_params += module.weight.numel()
+                    if module.bias is not None:
+                        layer_params += module.bias.numel()
+                elif isinstance(module, nn.LayerNorm):
+                    layer_params += module.weight.numel() + module.bias.numel()
+        
+        # Output layers (estimated)
+        ln_params = self.hidden_size * 2  # LayerNorm
+        lm_head_params = self.hidden_size * 32000  # vocab_size
+        
+        return embed_params + layer_params + ln_params + lm_head_params
     
     def get_param_count(self):
         return sum(p.numel() for p in self.parameters())
@@ -68,9 +109,11 @@ class LargeTestModel(nn.Module):
         for layer in self.layers:
             x = x + layer(x)  # Residual connection
         
-        # Apply extra layers
-        for layer in self.extra_layers:
-            x = x + layer(x)
+        # Apply extra layer if exists
+        if self.extra_layer is not None:
+            x_extra = self.extra_layer(x)
+            # Use only a subset to maintain original dimensions
+            x = x + x_extra[:, :, :self.hidden_size]
         
         x = self.ln_f(x)
         return self.lm_head(x)
@@ -155,8 +198,8 @@ def quick_memory_transfer_test():
 
 
 def quick_compute_efficiency_test():
-    """Quick test of compute efficiency impact with 20GB model and 5GB transfer"""
-    print("\n=== Quick Compute Efficiency Test (20GB model, 5GB transfer) ===")
+    """Quick test of compute efficiency impact with ~20GB model and large transfer"""
+    print("\n=== Quick Compute Efficiency Test (~20GB model, large transfer) ===")
     
     if not torch.cuda.is_available():
         print("CUDA not available, skipping test")
@@ -168,36 +211,71 @@ def quick_compute_efficiency_test():
     gpu_memory_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
     print(f"GPU Memory: {gpu_memory_gb:.1f} GB")
     
-    if gpu_memory_gb < 25:  # Need at least 25GB for 20GB model + overhead
-        print("Warning: GPU memory < 25GB, reducing model size to fit")
-        # Scale down model size based on available memory
-        scale_factor = min(1.0, (gpu_memory_gb - 5) / 20)  # Reserve 5GB for overhead
-        hidden_size = int(8192 * scale_factor)
-        num_layers = max(1, int(12 * scale_factor))
-        vocab_size = max(10000, int(50000 * scale_factor))
+    # Calculate safe model and transfer sizes
+    # Reserve memory: model + activations + transfer + overhead
+    available_memory = gpu_memory_gb * 0.9  # Use 90% of available memory
+    
+    # Target: ~18GB model + ~3GB activations + ~5GB transfer = ~26GB total
+    if available_memory < 26:
+        print(f"Warning: Only {available_memory:.1f}GB available, adjusting sizes...")
+        model_target_gb = max(8, available_memory * 0.6)  # 60% for model
+        transfer_target_gb = max(1, available_memory * 0.2)  # 20% for transfer
     else:
-        hidden_size = 8192
-        num_layers = 12
-        vocab_size = 50000
+        model_target_gb = 18  # Target 18GB model (safer than 20GB)
+        transfer_target_gb = 5   # Target 5GB transfer
+    
+    # Scale model parameters based on available memory
+    if gpu_memory_gb < 30:
+        print("Scaling model size for available memory...")
+        scale_factor = min(1.0, model_target_gb / 18)
+        hidden_size = max(1024, int(6144 * scale_factor))
+        num_layers = max(2, int(8 * scale_factor))
+        vocab_size = max(5000, int(32000 * scale_factor))
+    else:
+        hidden_size = 6144
+        num_layers = 8
+        vocab_size = 32000
+    
+    print(f"Target model size: {model_target_gb:.1f}GB, Transfer size: {transfer_target_gb:.1f}GB")
     
     try:
-        # Create large test model (targeting ~20GB)
-        print("Creating large test model...")
+        # Create model with target size
+        print("Creating test model...")
         model = LargeTestModel(
             hidden_size=hidden_size,
             num_layers=num_layers,
             vocab_size=vocab_size
         ).to(device)
         
-        batch_size = 4  # Smaller batch for large model
-        seq_len = 512
+        # Check actual model size and adjust if needed
+        actual_model_size = model.get_model_size_gb()
+        if actual_model_size > model_target_gb * 1.2:  # 20% tolerance
+            print(f"Model too large ({actual_model_size:.1f}GB), recreating with smaller parameters...")
+            del model
+            torch.cuda.empty_cache()
+            
+            # Reduce model size more aggressively
+            hidden_size = max(1024, int(hidden_size * 0.7))
+            num_layers = max(2, int(num_layers * 0.7))
+            vocab_size = max(5000, int(vocab_size * 0.8))
+            
+            model = LargeTestModel(
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                vocab_size=vocab_size
+            ).to(device)
+        
+        # Use smaller batch and sequence length for large model
+        batch_size = 2
+        seq_len = 256
         input_tensor = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
         
         print("\nTesting baseline performance...")
-        # Baseline performance
+        # Baseline performance with memory cleanup
         baseline_times = []
-        for i in range(10):  # Fewer iterations for large model
-            print(f"  Baseline iteration {i+1}/10", end="\r")
+        for i in range(8):  # Fewer iterations
+            print(f"  Baseline iteration {i+1}/8", end="\r")
+            torch.cuda.empty_cache()  # Clean before each iteration
             torch.cuda.synchronize()
             start = time.perf_counter()
             
@@ -214,17 +292,28 @@ def quick_compute_efficiency_test():
         baseline_avg = statistics.mean(baseline_times)
         print(f"\nBaseline compute: {baseline_avg:.2f} ms")
         
-        # Performance with concurrent large transfer (5GB)
-        print("\nTesting with concurrent 5GB transfer...")
-        max_transfer_gb = min(5.0, gpu_memory_gb * 0.2)  # 20% of GPU memory or 5GB
-        transfer_size = int((max_transfer_gb * 1024 * 1024 * 1024) // 4)  # Convert to float32 elements
-        print(f"Transfer size: {max_transfer_gb:.1f} GB")
+        # Calculate safe transfer size
+        torch.cuda.empty_cache()
+        free_memory = torch.cuda.mem_get_info()[0] / (1024**3)  # Free memory in GB
+        safe_transfer_gb = min(transfer_target_gb, free_memory * 0.8)  # Use 80% of free memory
+        transfer_size = int((safe_transfer_gb * 1024 * 1024 * 1024) // 4)  # Convert to float32 elements
+        
+        print(f"\nTesting with concurrent {safe_transfer_gb:.1f}GB transfer...")
+        print(f"Free GPU memory: {free_memory:.1f}GB")
+        
+        if safe_transfer_gb < 0.5:
+            print("Insufficient memory for transfer test, skipping...")
+            return
         
         transfer_times = []
-        for i in range(10):
-            print(f"  Transfer iteration {i+1}/10", end="\r")
+        successful_iterations = 0
+        
+        for i in range(8):
+            print(f"  Transfer iteration {i+1}/8", end="\r")
             try:
-                # Create large transfer tensor on CPU
+                torch.cuda.empty_cache()  # Clean before each iteration
+                
+                # Create transfer tensor on CPU
                 transfer_tensor = torch.randn(transfer_size, dtype=torch.float32)
                 
                 torch.cuda.synchronize()
@@ -234,7 +323,7 @@ def quick_compute_efficiency_test():
                     # Start model computation
                     output = model(input_tensor)
                     
-                    # Concurrent large transfer
+                    # Concurrent transfer
                     gpu_transfer = transfer_tensor.to(device, non_blocking=True)
                     
                     # Ensure all operations complete
@@ -242,38 +331,47 @@ def quick_compute_efficiency_test():
                 
                 end = time.perf_counter()
                 transfer_times.append((end - start) * 1000)
+                successful_iterations += 1
                 
                 del output, gpu_transfer, transfer_tensor
                 torch.cuda.empty_cache()
                 
             except torch.cuda.OutOfMemoryError:
-                print(f"\n  OOM during transfer test, reducing transfer size")
-                transfer_size = transfer_size // 2
-                max_transfer_gb = max_transfer_gb / 2
-                if max_transfer_gb < 0.5:  # Less than 500MB
-                    print("  Transfer size too small, skipping transfer test")
+                print(f"\n  OOM during iteration {i+1}, reducing transfer size")
+                transfer_size = int(transfer_size * 0.7)  # Reduce by 30%
+                safe_transfer_gb = safe_transfer_gb * 0.7
+                if safe_transfer_gb < 0.3:  # Less than 300MB
+                    print("  Transfer size too small, stopping transfer test")
                     break
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                print(f"\n  Error in iteration {i+1}: {e}")
+                torch.cuda.empty_cache()
                 continue
         
-        if transfer_times:
+        if transfer_times and successful_iterations >= 3:
             transfer_avg = statistics.mean(transfer_times)
             overhead = ((transfer_avg - baseline_avg) / baseline_avg) * 100
             
-            print(f"\nWith {max_transfer_gb:.1f}GB transfer: {transfer_avg:.2f} ms")
+            print(f"\nWith {safe_transfer_gb:.1f}GB transfer: {transfer_avg:.2f} ms")
             print(f"Overhead: {overhead:.1f}%")
+            print(f"Successful iterations: {successful_iterations}/8")
             
             # Calculate effective bandwidth during compute
             if transfer_avg > baseline_avg:
                 transfer_time = transfer_avg - baseline_avg
-                effective_bandwidth = max_transfer_gb / (transfer_time / 1000)
+                effective_bandwidth = safe_transfer_gb / (transfer_time / 1000)
                 print(f"Effective transfer bandwidth during compute: {effective_bandwidth:.2f} GB/s")
+        else:
+            print(f"\nInsufficient successful iterations ({successful_iterations}) for reliable results")
         
         # Cleanup
         del model
         torch.cuda.empty_cache()
         
     except torch.cuda.OutOfMemoryError:
-        print("OOM creating large model. GPU memory insufficient for 20GB model test.")
+        print("OOM creating model. GPU memory insufficient for large model test.")
         torch.cuda.empty_cache()
     except Exception as e:
         print(f"Error in compute efficiency test: {e}")
