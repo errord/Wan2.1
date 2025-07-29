@@ -459,10 +459,137 @@ class FSDPNetworkTester:
                 logger.info(f"Sync frequency every {sync_freq} iterations: {avg_time:.2f} ms/iter")
                 self.results[f"sync_freq_{sync_freq}"] = iteration_times
     
+    def test_network_bandwidth_under_load(self, sizes: List[int], 
+                                         concurrent_operations: List[int], num_iterations: int = 20):
+        """Test network bandwidth under different concurrent loads"""
+        logger.info(f"=== Testing Network Bandwidth Under Load (Rank {self.rank}) ===")
+        
+        for size_mb in sizes:
+            for num_concurrent in concurrent_operations:
+                latencies = []
+                num_elements = (size_mb * 1024 * 1024) // 4  # float32
+                
+                for _ in range(num_iterations):
+                    # Create multiple tensors for concurrent operations
+                    tensors = [torch.randn(num_elements // num_concurrent, device=self.device) 
+                              for _ in range(num_concurrent)]
+                    
+                    dist.barrier()
+                    start = time.perf_counter()
+                    
+                    # Perform concurrent allreduce operations
+                    if num_concurrent == 1:
+                        dist.all_reduce(tensors[0], op=dist.ReduceOp.SUM)
+                    else:
+                        # Simulate concurrent operations by rapid sequential calls
+                        for tensor in tensors:
+                            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=False)
+                    
+                    torch.cuda.synchronize()
+                    end = time.perf_counter()
+                    
+                    latencies.append((end - start) * 1000)
+                    
+                    # Cleanup
+                    for tensor in tensors:
+                        del tensor
+                
+                if self.rank == 0:
+                    avg_latency = statistics.mean(latencies)
+                    std_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
+                    effective_bandwidth = (size_mb * self.world_size) / (avg_latency / 1000)  # MB/s
+                    
+                    logger.info(f"Size {size_mb}MB, {num_concurrent} concurrent ops: "
+                              f"{avg_latency:.2f}±{std_latency:.2f} ms, "
+                              f"Bandwidth: {effective_bandwidth:.2f} MB/s")
+                    
+                    self.results[f"network_load_{size_mb}MB_{num_concurrent}ops"] = latencies
+    
     def cleanup(self):
         """Cleanup distributed environment"""
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+def run_distributed_tests(args):
+    """Run distributed tests - for multi-node multi-GPU setup"""
+    # Get distributed environment variables
+    rank = int(os.environ.get('RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    master_addr = os.environ.get('MASTER_ADDR', 'localhost')
+    master_port = os.environ.get('MASTER_PORT', '12355')
+    
+    if world_size == 1:
+        logger.error("Distributed testing requires WORLD_SIZE > 1")
+        logger.error("Please set environment variables: RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT")
+        logger.error("Example for master node (rank 0):")
+        logger.error("  export RANK=0")
+        logger.error("  export WORLD_SIZE=2") 
+        logger.error("  export LOCAL_RANK=0")
+        logger.error("  export MASTER_ADDR='10.79.79.197'")
+        logger.error("  export MASTER_PORT='7860'")
+        logger.error("Example for worker node (rank 1):")
+        logger.error("  export RANK=1")
+        logger.error("  export WORLD_SIZE=2")
+        logger.error("  export LOCAL_RANK=0")
+        logger.error("  export MASTER_ADDR='10.79.79.197'")
+        logger.error("  export MASTER_PORT='7860'")
+        sys.exit(1)
+    
+    device = torch.device(f'cuda:{local_rank}')
+    torch.cuda.set_device(device)
+    
+    logger.info(f"Starting distributed test - Rank: {rank}/{world_size}, Local Rank: {local_rank}")
+    logger.info(f"Master: {master_addr}:{master_port}")
+    logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
+    
+    fsdp_tester = FSDPNetworkTester(rank, world_size, device)
+    
+    try:
+        fsdp_tester.setup_distributed(master_addr, master_port)
+        
+        if rank == 0:
+            logger.info(f"Running distributed tests with {world_size} nodes/GPUs")
+            logger.info("Testing network communication between nodes...")
+        
+        # Test network communication with larger sizes for multi-node
+        comm_sizes = [1, 4, 16, 64, 256, 512, 1024]  # MB - larger sizes for network testing
+        fsdp_tester.test_allreduce_latency(comm_sizes, num_iterations=args.num_iterations)
+        
+        # Test FSDP training performance across nodes
+        batch_sizes = [2, 4, 8, 16]  # Smaller batches for multi-node
+        fsdp_tester.test_fsdp_forward_backward(batch_sizes, num_iterations=args.num_iterations // 2)
+        
+        # Test synchronization frequency impact in multi-node setup
+        sync_frequencies = [1, 2, 4, 8, 16]
+        fsdp_tester.test_parameter_sync_frequency(sync_frequencies, num_iterations=args.num_iterations)
+        
+        # Additional multi-node specific tests
+        if rank == 0:
+            logger.info("Testing multi-node specific scenarios...")
+        
+        # Test network bandwidth under different loads
+        fsdp_tester.test_network_bandwidth_under_load(
+            sizes=[64, 256, 1024],  # MB
+            concurrent_operations=[1, 2, 4],
+            num_iterations=20
+        )
+        
+        # Save results from rank 0
+        if rank == 0 and args.save_results:
+            import json
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f'distributed_performance_results_{world_size}nodes_{timestamp}.json'
+            with open(filename, 'w') as f:
+                json.dump(fsdp_tester.results, f, indent=2)
+            logger.info(f"Distributed results saved to {filename}")
+    
+    except Exception as e:
+        logger.error(f"Distributed test failed on rank {rank}: {e}")
+        raise
+    finally:
+        fsdp_tester.cleanup()
 
 
 def run_single_gpu_tests(args):
@@ -493,61 +620,29 @@ def run_single_gpu_tests(args):
     # Save results
     if args.save_results:
         import json
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
         all_results = {**memory_tester.results, **compute_tester.results}
-        with open(f'performance_results_gpu_{args.gpu_id}.json', 'w') as f:
+        filename = f'single_gpu_performance_results_{timestamp}.json'
+        with open(filename, 'w') as f:
             json.dump(all_results, f, indent=2)
-        logger.info(f"Results saved to performance_results_gpu_{args.gpu_id}.json")
+        logger.info(f"Results saved to {filename}")
 
 
 def run_distributed_worker(rank: int, world_size: int, args):
-    """Worker function for distributed testing"""
-    device = torch.device(f'cuda:{rank}')
-    
-    fsdp_tester = FSDPNetworkTester(rank, world_size, device)
-    
-    try:
-        fsdp_tester.setup_distributed(args.master_addr, args.master_port)
-        
-        if rank == 0:
-            logger.info(f"Running distributed tests with {world_size} GPUs")
-        
-        # Test network communication
-        comm_sizes = [1, 4, 16, 64, 256]  # MB
-        fsdp_tester.test_allreduce_latency(comm_sizes, num_iterations=args.num_iterations)
-        
-        # Test FSDP training performance
-        batch_sizes = [4, 8, 16]
-        fsdp_tester.test_fsdp_forward_backward(batch_sizes, num_iterations=args.num_iterations // 2)
-        
-        # Test synchronization frequency impact
-        sync_frequencies = [1, 2, 4, 8]
-        fsdp_tester.test_parameter_sync_frequency(sync_frequencies, num_iterations=args.num_iterations)
-        
-        # Save results from rank 0
-        if rank == 0 and args.save_results:
-            import json
-            with open(f'fsdp_performance_results_{world_size}gpus.json', 'w') as f:
-                json.dump(fsdp_tester.results, f, indent=2)
-            logger.info(f"FSDP results saved to fsdp_performance_results_{world_size}gpus.json")
-    
-    finally:
-        fsdp_tester.cleanup()
+    """Worker function for distributed testing - DEPRECATED: Use run_distributed_tests instead"""
+    logger.warning("run_distributed_worker is deprecated for multi-node setup")
+    logger.warning("Use run_distributed_tests with proper environment variables instead")
+    return
 
 
 def main():
     parser = argparse.ArgumentParser(description='Wan2.1 Performance Testing')
     parser.add_argument('--test_type', choices=['single', 'distributed', 'all'], 
-                       default='all', help='Type of test to run')
+                       default='single', help='Type of test to run')
     parser.add_argument('--gpu_id', type=int, default=0, 
                        help='GPU ID for single GPU tests')
-    parser.add_argument('--num_gpus', type=int, default=2,
-                       help='Number of GPUs for distributed tests')
     parser.add_argument('--num_iterations', type=int, default=100,
                        help='Number of iterations for each test')
-    parser.add_argument('--master_addr', type=str, default='localhost',
-                       help='Master address for distributed testing')
-    parser.add_argument('--master_port', type=str, default='12355',
-                       help='Master port for distributed testing')
     parser.add_argument('--save_results', action='store_true',
                        help='Save results to JSON files')
     
@@ -564,17 +659,8 @@ def main():
         run_single_gpu_tests(args)
     
     if args.test_type in ['distributed', 'all']:
-        if args.num_gpus > torch.cuda.device_count():
-            logger.error(f"Requested {args.num_gpus} GPUs but only {torch.cuda.device_count()} available")
-            sys.exit(1)
-        
         logger.info("Starting distributed tests...")
-        mp.spawn(
-            run_distributed_worker,
-            args=(args.num_gpus, args),
-            nprocs=args.num_gpus,
-            join=True
-        )
+        run_distributed_tests(args)
     
     logger.info("All tests completed!")
 
