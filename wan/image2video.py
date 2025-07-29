@@ -17,7 +17,7 @@ import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 import torch.distributed.fsdp
-
+import torch.profiler
 from .distributed.fsdp import shard_model, shard_model_with_cpu_offload
 from .modules.clip import CLIPModel
 from .modules.model import WanModel
@@ -439,9 +439,19 @@ class WanI2V:
                         start_mem = torch.cuda.memory_allocated()
 
                     with execution_timer("Wan I2V wan model forward"):
-                        noise_pred_cond = self.model(
-                            latent_model_input, t=timestep, **arg_c)[0].to(
-                                torch.device('cpu') if offload_model else self.device)
+                        with torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ],
+                            record_shapes=True,
+                            profile_memory=True,
+                            with_stack=True
+                        ) as prof:
+                            noise_pred_cond = self.model(
+                                latent_model_input, t=timestep, **arg_c)[0].to(
+                                    torch.device('cpu') if offload_model else self.device)
+                        prof.export_chrome_trace("fsdp_trace.json")
                         if offload_model:
                             torch.cuda.empty_cache()
                         noise_pred_uncond = self.model(
