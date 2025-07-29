@@ -207,26 +207,35 @@ class PrecisionPerformanceTester:
         """Calculate model configurations for different precisions targeting ~28GB"""
         configs = {}
         
-        # Start with base config and adjust for memory target
-        base_hidden = 8192
-        base_layers = 24
+        # Start with much smaller base config to avoid OOM
+        base_hidden = 4096  # Reduced from 8192
+        base_layers = 8     # Reduced from 24
         
         # Test model to get parameter count
         test_model = LargeTestModel(hidden_size=base_hidden, num_layers=base_layers)
+        
+        # Target much smaller memory usage (leave more room for activations)
+        target_memory_gb = 20  # Reduced from 28
         
         for precision in ['fp32', 'fp16', 'bf16']:
             dtype = torch.float32 if precision == 'fp32' else torch.float16
             model_size_gb = test_model.get_model_size_gb(dtype)
             
             # Scale model size to fit target memory
-            scale_factor = (self.target_memory_gb / model_size_gb) ** 0.5
+            scale_factor = (target_memory_gb / model_size_gb) ** 0.5
             
-            # Adjust hidden size and layers
-            scaled_hidden = int(base_hidden * scale_factor)
-            scaled_layers = max(1, int(base_layers * scale_factor))
+            # Adjust hidden size and layers with more conservative scaling
+            scaled_hidden = int(base_hidden * scale_factor * 0.8)  # Extra conservative factor
+            scaled_layers = max(1, int(base_layers * scale_factor * 0.8))
             
             # Ensure hidden size is divisible by attention heads
             scaled_hidden = (scaled_hidden // 128) * 128
+            
+            # For fp16/bf16, we can use slightly larger models
+            if precision in ['fp16', 'bf16']:
+                scaled_hidden = int(scaled_hidden * 1.4)
+                scaled_layers = int(scaled_layers * 1.2)
+                scaled_hidden = (scaled_hidden // 128) * 128
             
             configs[precision] = {
                 'hidden_size': scaled_hidden,
@@ -241,9 +250,9 @@ class PrecisionPerformanceTester:
         torch.cuda.empty_cache()
         return configs
     
-    def test_precision_performance(self, batch_sizes: List[int] = [4, 8, 16], 
-                                 seq_lengths: List[int] = [1024, 2048], 
-                                 num_iterations: int = 20):
+    def test_precision_performance(self, batch_sizes: List[int] = [2, 4], # Reduced batch sizes
+                                 seq_lengths: List[int] = [512, 1024],   # Reduced seq lengths 
+                                 num_iterations: int = 10):              # Reduced iterations
         """Test forward and backward pass performance across precisions"""
         logger.info("=== Testing Precision Performance ===")
         
@@ -258,148 +267,196 @@ class PrecisionPerformanceTester:
                 continue
                 
             logger.info(f"\nTesting {precision_name.upper()}...")
-            config = self.model_configs[precision_name]
             
-            # Create model with appropriate configuration
-            model = LargeTestModel(
-                hidden_size=config['hidden_size'],
-                num_layers=config['num_layers']
-            ).to(device=self.device, dtype=dtype)
-            
-            # Setup optimizer and loss
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-            criterion = nn.CrossEntropyLoss()
-            
-            precision_results = {
+            # Initialize results structure
+            self.results[precision_name] = {
                 'forward_times': [],
                 'backward_times': [],
                 'total_times': [],
-                'memory_usage': [],
-                'throughput': []  # tokens per second
+                'throughput': [],
+                'memory_usage': []
             }
             
-            # Test different batch sizes and sequence lengths
-            for batch_size in batch_sizes:
-                for seq_len in seq_lengths:
-                    try:
-                        # Generate input data
-                        input_ids = torch.randint(0, 32000, (batch_size, seq_len), device=self.device)
-                        target_ids = torch.randint(0, 32000, (batch_size, seq_len), device=self.device)
-                        
-                        # Warmup
-                        for _ in range(3):
-                            optimizer.zero_grad()
-                            with torch.cuda.amp.autocast(enabled=(dtype != torch.float32)):
-                                logits = model(input_ids)
-                                loss = criterion(logits.view(-1, logits.size(-1)), target_ids.view(-1))
-                            loss.backward()
-                            optimizer.step()
-                        
-                        torch.cuda.synchronize()
-                        
-                        # Benchmark
-                        for i in range(num_iterations):
-                            torch.cuda.empty_cache()
-                            torch.cuda.reset_peak_memory_stats()
-                            start_mem = torch.cuda.memory_allocated()
-                            
-                            optimizer.zero_grad()
-                            
-                            # Forward pass
-                            torch.cuda.synchronize()
-                            start_forward = time.perf_counter()
-                            
-                            with torch.cuda.amp.autocast(enabled=(dtype != torch.float32)):
-                                logits = model(input_ids)
-                                loss = criterion(logits.view(-1, logits.size(-1)), target_ids.view(-1))
-                            
-                            torch.cuda.synchronize()
-                            end_forward = time.perf_counter()
-                            
-                            # Backward pass
-                            start_backward = time.perf_counter()
-                            loss.backward()
-                            torch.cuda.synchronize()
-                            end_backward = time.perf_counter()
-                            
-                            optimizer.step()
-                            torch.cuda.synchronize()
-                            
-                            # Record metrics
-                            forward_time = (end_forward - start_forward) * 1000
-                            backward_time = (end_backward - start_backward) * 1000
-                            total_time = forward_time + backward_time
-                            peak_mem = torch.cuda.max_memory_allocated()
-                            
-                            # Calculate throughput (tokens per second)
-                            total_tokens = batch_size * seq_len
-                            throughput = total_tokens / (total_time / 1000)
-                            
-                            precision_results['forward_times'].append(forward_time)
-                            precision_results['backward_times'].append(backward_time)
-                            precision_results['total_times'].append(total_time)
-                            precision_results['memory_usage'].append(peak_mem / 1024**3)  # GB
-                            precision_results['throughput'].append(throughput)
-                    
-                    except torch.cuda.OutOfMemoryError:
-                        logger.warning(f"OOM for {precision_name} batch_size={batch_size}, seq_len={seq_len}")
-                        torch.cuda.empty_cache()
-                        continue
+            config = self.model_configs[precision_name]
             
-            # Store results
-            self.results[precision_name] = precision_results
-            
-            # Log summary statistics
-            if precision_results['total_times']:
-                avg_forward = statistics.mean(precision_results['forward_times'])
-                avg_backward = statistics.mean(precision_results['backward_times'])
-                avg_total = statistics.mean(precision_results['total_times'])
-                avg_memory = statistics.mean(precision_results['memory_usage'])
-                avg_throughput = statistics.mean(precision_results['throughput'])
+            try:
+                # Create model with calculated configuration
+                model = LargeTestModel(
+                    hidden_size=config['hidden_size'],
+                    num_layers=config['num_layers']
+                ).to(self.device, dtype=dtype)
                 
-                logger.info(f"{precision_name.upper()} Results:")
-                logger.info(f"  Forward: {avg_forward:.2f} ms")
-                logger.info(f"  Backward: {avg_backward:.2f} ms")
-                logger.info(f"  Total: {avg_total:.2f} ms")
-                logger.info(f"  Memory: {avg_memory:.2f} GB")
-                logger.info(f"  Throughput: {avg_throughput:.0f} tokens/s")
-            
-            # Cleanup
-            del model, optimizer
-            torch.cuda.empty_cache()
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+                criterion = nn.CrossEntropyLoss()
+                
+                successful_runs = 0
+                
+                for batch_size in batch_sizes:
+                    for seq_len in seq_lengths:
+                        if successful_runs >= 3:  # Limit successful runs to avoid OOM accumulation
+                            break
+                            
+                        try:
+                            # Generate test data
+                            input_ids = torch.randint(0, 32000, (batch_size, seq_len), device=self.device)
+                            target_ids = torch.randint(0, 32000, (batch_size, seq_len), device=self.device)
+                            
+                            # Warmup (reduced)
+                            for _ in range(2):
+                                optimizer.zero_grad()
+                                with torch.amp.autocast('cuda', enabled=(dtype != torch.float32)):
+                                    logits = model(input_ids)
+                                    loss = criterion(logits.view(-1, logits.size(-1)), target_ids.view(-1))
+                                loss.backward()
+                                optimizer.step()
+                                torch.cuda.empty_cache()
+                            
+                            # Benchmark
+                            forward_times = []
+                            backward_times = []
+                            total_times = []
+                            
+                            for _ in range(num_iterations):
+                                optimizer.zero_grad()
+                                torch.cuda.empty_cache()  # Clear cache before each iteration
+                                
+                                # Measure memory before
+                                torch.cuda.synchronize()
+                                start_mem = torch.cuda.memory_allocated()
+                                
+                                # Forward pass
+                                start_total = time.perf_counter()
+                                torch.cuda.synchronize()
+                                start_forward = time.perf_counter()
+                                
+                                with torch.amp.autocast('cuda', enabled=(dtype != torch.float32)):
+                                    logits = model(input_ids)
+                                    loss = criterion(logits.view(-1, logits.size(-1)), target_ids.view(-1))
+                                
+                                torch.cuda.synchronize()
+                                end_forward = time.perf_counter()
+                                
+                                # Backward pass
+                                start_backward = time.perf_counter()
+                                loss.backward()
+                                torch.cuda.synchronize()
+                                end_backward = time.perf_counter()
+                                
+                                optimizer.step()
+                                torch.cuda.synchronize()
+                                end_total = time.perf_counter()
+                                
+                                # Record timings
+                                forward_time = (end_forward - start_forward) * 1000
+                                backward_time = (end_backward - start_backward) * 1000
+                                total_time = (end_total - start_total) * 1000
+                                
+                                forward_times.append(forward_time)
+                                backward_times.append(backward_time)
+                                total_times.append(total_time)
+                                
+                                # Calculate throughput
+                                tokens_processed = batch_size * seq_len
+                                throughput = tokens_processed / (total_time / 1000)  # tokens/sec
+                                
+                                # Memory usage
+                                peak_mem = torch.cuda.max_memory_allocated()
+                                memory_usage = (peak_mem - start_mem) / (1024**3)  # GB
+                                
+                                self.results[precision_name]['forward_times'].append(forward_time)
+                                self.results[precision_name]['backward_times'].append(backward_time)
+                                self.results[precision_name]['total_times'].append(total_time)
+                                self.results[precision_name]['throughput'].append(throughput)
+                                self.results[precision_name]['memory_usage'].append(memory_usage)
+                            
+                            successful_runs += 1
+                            logger.info(f"  Batch {batch_size}, Seq {seq_len}: "
+                                      f"Forward: {statistics.mean(forward_times):.2f}ms, "
+                                      f"Backward: {statistics.mean(backward_times):.2f}ms, "
+                                      f"Total: {statistics.mean(total_times):.2f}ms")
+                            
+                        except torch.cuda.OutOfMemoryError:
+                            logger.warning(f"OOM for {precision_name} batch_size={batch_size}, seq_len={seq_len}")
+                            torch.cuda.empty_cache()
+                            continue
+                    
+                    if successful_runs >= 3:
+                        break
+                
+                del model, optimizer
+                torch.cuda.empty_cache()
+                
+                if successful_runs == 0:
+                    logger.warning(f"No successful runs for {precision_name}")
+                else:
+                    logger.info(f"Completed {successful_runs} successful configurations for {precision_name}")
+                    
+            except Exception as e:
+                logger.error(f"Error testing {precision_name}: {e}")
+                torch.cuda.empty_cache()
     
     def analyze_precision_results(self):
-        """Analyze and compare results across precisions"""
+        """Analyze and display precision performance results"""
         logger.info("\n=== Precision Performance Analysis ===")
         
-        if not self.results:
-            logger.warning("No results to analyze")
+        # Check if we have any valid results
+        valid_precisions = []
+        for precision in ['fp32', 'fp16', 'bf16']:
+            if (precision in self.results and 
+                self.results[precision]['total_times'] and 
+                len(self.results[precision]['total_times']) > 0):
+                valid_precisions.append(precision)
+        
+        if not valid_precisions:
+            logger.error("No valid test results found! All tests failed due to OOM.")
+            logger.error("Model configurations may be too large for available GPU memory.")
+            logger.error("Consider:")
+            logger.error("1. Reducing hidden_size and num_layers in model configs")
+            logger.error("2. Using smaller batch_sizes and seq_lengths")
+            logger.error("3. Ensuring sufficient GPU memory is available")
             return
         
-        # Compare relative performance
-        baseline_precision = 'fp32'
-        if baseline_precision in self.results:
-            baseline_total = statistics.mean(self.results[baseline_precision]['total_times'])
-            baseline_throughput = statistics.mean(self.results[baseline_precision]['throughput'])
-            baseline_memory = statistics.mean(self.results[baseline_precision]['memory_usage'])
-            
-            logger.info("Performance relative to FP32:")
-            logger.info(f"{'Precision':<10} {'Speedup':<10} {'Throughput':<15} {'Memory':<15}")
-            logger.info("-" * 60)
-            
-            for precision in ['fp32', 'fp16', 'bf16']:
-                if precision in self.results and self.results[precision]['total_times']:
-                    avg_total = statistics.mean(self.results[precision]['total_times'])
-                    avg_throughput = statistics.mean(self.results[precision]['throughput'])
-                    avg_memory = statistics.mean(self.results[precision]['memory_usage'])
-                    
-                    speedup = baseline_total / avg_total
-                    throughput_ratio = avg_throughput / baseline_throughput
-                    memory_ratio = avg_memory / baseline_memory
-                    
-                    logger.info(f"{precision.upper():<10} {speedup:.2f}x     "
-                              f"{throughput_ratio:.2f}x          "
-                              f"{memory_ratio:.2f}x")
+        logger.info(f"Valid results for precisions: {valid_precisions}")
+        
+        # Use the first valid precision as baseline
+        baseline_precision = valid_precisions[0]
+        baseline_total = statistics.mean(self.results[baseline_precision]['total_times'])
+        baseline_throughput = statistics.mean(self.results[baseline_precision]['throughput'])
+        baseline_memory = statistics.mean(self.results[baseline_precision]['memory_usage'])
+        
+        logger.info(f"Using {baseline_precision.upper()} as baseline")
+        logger.info(f"{'Precision':<10} {'Speedup':<10} {'Throughput':<15} {'Memory':<15}")
+        logger.info("-" * 60)
+        
+        for precision in valid_precisions:
+            if self.results[precision]['total_times']:
+                avg_total = statistics.mean(self.results[precision]['total_times'])
+                avg_throughput = statistics.mean(self.results[precision]['throughput'])
+                avg_memory = statistics.mean(self.results[precision]['memory_usage'])
+                
+                speedup = baseline_total / avg_total
+                throughput_ratio = avg_throughput / baseline_throughput
+                memory_ratio = avg_memory / baseline_memory
+                
+                logger.info(f"{precision.upper():<10} {speedup:.2f}x     "
+                          f"{throughput_ratio:.2f}x         {memory_ratio:.2f}x")
+        
+        # Additional detailed statistics
+        logger.info("\n=== Detailed Statistics ===")
+        for precision in valid_precisions:
+            results = self.results[precision]
+            if results['total_times']:
+                logger.info(f"\n{precision.upper()}:")
+                logger.info(f"  Forward:    {statistics.mean(results['forward_times']):.2f} ± "
+                          f"{statistics.stdev(results['forward_times']) if len(results['forward_times']) > 1 else 0:.2f} ms")
+                logger.info(f"  Backward:   {statistics.mean(results['backward_times']):.2f} ± "
+                          f"{statistics.stdev(results['backward_times']) if len(results['backward_times']) > 1 else 0:.2f} ms")
+                logger.info(f"  Total:      {statistics.mean(results['total_times']):.2f} ± "
+                          f"{statistics.stdev(results['total_times']) if len(results['total_times']) > 1 else 0:.2f} ms")
+                logger.info(f"  Throughput: {statistics.mean(results['throughput']):.1f} ± "
+                          f"{statistics.stdev(results['throughput']) if len(results['throughput']) > 1 else 0:.1f} tokens/s")
+                logger.info(f"  Memory:     {statistics.mean(results['memory_usage']):.2f} ± "
+                          f"{statistics.stdev(results['memory_usage']) if len(results['memory_usage']) > 1 else 0:.2f} GB")
 
 
 class DistributedPrecisionTester:
