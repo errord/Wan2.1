@@ -268,23 +268,33 @@ def analyze_system_info():
         props = torch.cuda.get_device_properties(device)
         print(f"GPU: {torch.cuda.get_device_name(device)}")
         print(f"GPU Memory: {props.total_memory / (1024**3):.1f} GB")
-        print(f"Memory Clock Rate: {props.memory_clock_rate / 1000:.0f} MHz")
-        print(f"Memory Bus Width: {props.memory_bus_width} bits")
+        print(f"Compute Capability: {props.major}.{props.minor}")
+        print(f"Multi-processors: {props.multi_processor_count}")
         
-        # Theoretical memory bandwidth
-        theoretical_bw = (props.memory_clock_rate * 2 * props.memory_bus_width / 8) / (1024**3)
-        print(f"Theoretical Memory BW: {theoretical_bw:.1f} GB/s")
+        # RTX 5090 specifications (known values)
+        if "RTX 5090" in torch.cuda.get_device_name(device):
+            print(f"Memory Type: GDDR6X (estimated)")
+            print(f"Memory Clock Rate: ~21000 MHz (estimated)")
+            print(f"Memory Bus Width: 512 bits (estimated)")
+            print(f"Theoretical Memory BW: ~1344 GB/s (estimated)")
+        else:
+            print(f"Memory specifications: Unknown for this GPU")
         
-        # PCIe information (approximate)
+        # PCIe information (general)
         print(f"PCIe: Likely PCIe 4.0 x16 (~32 GB/s peak)")
+        
+        # Current GPU memory usage
+        memory_allocated = torch.cuda.memory_allocated(device) / (1024**3)
+        memory_reserved = torch.cuda.memory_reserved(device) / (1024**3)
+        print(f"GPU Memory - Allocated: {memory_allocated:.2f} GB, Reserved: {memory_reserved:.2f} GB")
     
     # Check if pinned memory is supported
     try:
         test_tensor = torch.randn(1000).pin_memory()
         print("Pinned memory: Supported")
         del test_tensor
-    except:
-        print("Pinned memory: Not supported")
+    except Exception as e:
+        print(f"Pinned memory: Not supported ({e})")
     
     # Memory info
     try:
@@ -294,6 +304,14 @@ def analyze_system_info():
         print(f"Available RAM: {mem.available / (1024**3):.1f} GB")
     except ImportError:
         print("psutil not available for system memory info")
+    
+    # PyTorch and CUDA versions
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA version: {torch.version.cuda}")
+    
+    # Check CUDA device count and current device
+    print(f"CUDA devices: {torch.cuda.device_count()}")
+    print(f"Current device: {torch.cuda.current_device()}")
 
 
 def main():
